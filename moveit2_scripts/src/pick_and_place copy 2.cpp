@@ -58,9 +58,9 @@ public:
   void joint_state_clb(const sensor_msgs::msg::JointState::SharedPtr msg) {
     mtx.lock();
 
-    this->joint_group_positions_arm_tmp[0] = msg->position[3];
+    this->joint_group_positions_arm_tmp[0] = msg->position[0];
     this->joint_group_positions_arm_tmp[1] = msg->position[2];
-    this->joint_group_positions_arm_tmp[2] = msg->position[0];
+    this->joint_group_positions_arm_tmp[2] = msg->position[3];
     this->joint_group_positions_arm_tmp[3] = msg->position[4];
     this->joint_group_positions_arm_tmp[4] = msg->position[5];
     this->joint_group_positions_arm_tmp[5] = msg->position[6];
@@ -184,7 +184,7 @@ public:
 
     RCLCPP_INFO(LOGGER, "Approach to object");
 
-    float delta = 0.05;
+    float delta = 0.04;
 
     target_pose1.position.z = target_pose1.position.z - delta;
     move_group_arm.setPoseTarget(target_pose1);
@@ -229,29 +229,10 @@ public:
 
     RCLCPP_INFO(LOGGER, "Deapproach to object");
 
-    // Copy join values
-    mtx.lock();
-    this->joint_group_positions_arm = this->joint_group_positions_arm_tmp;
-    mtx.unlock();
+    float delta = 0.04;
 
-    for (auto x : this->joint_group_positions_arm) {
-      RCLCPP_INFO(LOGGER, "joint_group_positions_arm: %.2f", x);
-    }
-
-    // For some reason I cannot get current  joint positions, so I need to use
-    // basolute positions
-
-    float delta = -0.15;
-
-    if (joint_group_positions_arm[1] < -1.5)
-      delta = 0.15;
-
-    joint_group_positions_arm[1] += delta; // Elbow
-
-    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
-                joint_group_positions_arm[1]);
-
-    move_group_arm.setJointValueTarget(joint_group_positions_arm);
+    target_pose1.position.z = target_pose1.position.z + delta;
+    move_group_arm.setPoseTarget(target_pose1);
 
     bool success_arm = (move_group_arm.plan(my_plan_arm) ==
                         moveit::planning_interface::MoveItErrorCode::SUCCESS);
@@ -281,17 +262,9 @@ public:
     // For some reason I cannot get current  joint positions, so I need to use
     // basolute positions
 
-    float delta = 3.14;
-
-    if (joint_group_positions_arm[0] > 0)
-      delta = -3.14;
-
-    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
-                joint_group_positions_arm[0]);
-
     // joint_group_positions_arm[0] += 3.14; // Elbow
     // joint_group_positions_arm[1] = -2.09; // Shoulder Lift
-    joint_group_positions_arm[0] += delta; // Shoulder Pan
+    joint_group_positions_arm[2] += 1.0; // Shoulder Pan
     // joint_group_positions_arm[3] = 4.58;  // Wrist 1
     // joint_group_positions_arm[4] = 1.57;  // Wrist 2
     // joint_group_positions_arm[5] = 5.7;   // Wrist 3
@@ -344,7 +317,7 @@ public:
     }
     rclcpp::Rate(1.0).sleep();
 
-    // RCLCPP_INFO(LOGGER, "approach()");
+    RCLCPP_INFO(LOGGER, "approach()");
 
     status = approach();
     if (!status) {
@@ -352,6 +325,8 @@ public:
       return;
     }
     rclcpp::Rate(1.0).sleep();
+
+    // current_state();
 
     RCLCPP_INFO(LOGGER, "close_gripper()");
 
@@ -375,8 +350,7 @@ public:
 
     // current_state();
 
-    RCLCPP_INFO(LOGGER, "move_to_drop()");
-
+    // move_to_drop();
     status = move_to_drop();
     if (!status) {
       RCLCPP_ERROR(LOGGER, "move_to_drop() failed");
@@ -385,13 +359,7 @@ public:
 
     // current_state();
 
-    status = open_gripper();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "open_gripper() failed");
-      return;
-    }
-
-    RCLCPP_ERROR(LOGGER, "Mission finished succesfully");
+    // open_gripper();
   }
 
 private:
@@ -410,9 +378,9 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   moveit::planning_interface::MoveGroupInterface move_group_arm;
-  const moveit::core::JointModelGroup *joint_model_group_arm;
-
   moveit::planning_interface::MoveGroupInterface move_group_gripper;
+
+  const moveit::core::JointModelGroup *joint_model_group_arm;
   const moveit::core::JointModelGroup *joint_model_group_gripper;
 
   moveit::core::RobotStatePtr current_state_arm;

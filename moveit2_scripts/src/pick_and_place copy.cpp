@@ -1,3 +1,4 @@
+#include <functional>
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit/planning_scene_interface/planning_scene_interface.h>
 
@@ -7,15 +8,14 @@
 #include <moveit_msgs/msg/attached_collision_object.hpp>
 #include <moveit_msgs/msg/collision_object.hpp>
 
-#include "rclcpp/duration.hpp"
-#include "rclcpp/logging.hpp"
-#include "rclcpp/rate.hpp"
+#include "rclcpp/executors/multi_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
-#include "rclcpp/utilities.hpp"
+#include "rclcpp/subscription.hpp"
+#include "sensor_msgs/msg/detail/joint_state__struct.hpp"
 #include <string>
 
-#include <array>
 #include <mutex>
+
 #include <sensor_msgs/msg/joint_state.hpp>
 
 static const rclcpp::Logger LOGGER = rclcpp::get_logger("pick_and_place_test");
@@ -58,28 +58,12 @@ public:
   void joint_state_clb(const sensor_msgs::msg::JointState::SharedPtr msg) {
     mtx.lock();
 
-    this->joint_group_positions_arm_tmp[0] = msg->position[3];
+    this->joint_group_positions_arm_tmp[0] = msg->position[0];
     this->joint_group_positions_arm_tmp[1] = msg->position[2];
-    this->joint_group_positions_arm_tmp[2] = msg->position[0];
+    this->joint_group_positions_arm_tmp[2] = msg->position[3];
     this->joint_group_positions_arm_tmp[3] = msg->position[4];
     this->joint_group_positions_arm_tmp[4] = msg->position[5];
     this->joint_group_positions_arm_tmp[5] = msg->position[6];
-
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 0, msg->position[0]);
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 1, msg->position[2]);
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 2, msg->position[3]);
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 3, msg->position[4]);
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 4, msg->position[5]);
-    // this->joint_group_positions_arm_tmp.insert(
-    //     this->joint_group_positions_arm_tmp.begin() + 5, msg->position[6]);
-
-    // RCLCPP_INFO(LOGGER, "Vector size: %ld",
-    //             this->joint_group_positions_arm_tmp.size());
 
     mtx.unlock();
   }
@@ -178,13 +162,15 @@ public:
     } else {
       return false;
     }
+
+    RCLCPP_INFO(LOGGER, "Open Gripper finished %d!", success_gripper);
   }
 
   bool approach() {
 
     RCLCPP_INFO(LOGGER, "Approach to object");
 
-    float delta = 0.05;
+    float delta = 0.04;
 
     target_pose1.position.z = target_pose1.position.z - delta;
     move_group_arm.setPoseTarget(target_pose1);
@@ -223,9 +209,11 @@ public:
     } else {
       return false;
     }
+
+    RCLCPP_INFO(LOGGER, "Close Gripper finished %d!", success_gripper);
   }
 
-  bool deapproach() {
+  void deapproach() {
 
     RCLCPP_INFO(LOGGER, "Deapproach to object");
 
@@ -234,71 +222,43 @@ public:
     this->joint_group_positions_arm = this->joint_group_positions_arm_tmp;
     mtx.unlock();
 
-    for (auto x : this->joint_group_positions_arm) {
+    for (auto x : this->joint_group_positions_arm)
       RCLCPP_INFO(LOGGER, "joint_group_positions_arm: %.2f", x);
-    }
 
-    // For some reason I cannot get current  joint positions, so I need to use
-    // basolute positions
+    float delta = 0.04;
 
-    float delta = -0.15;
-
-    if (joint_group_positions_arm[1] < -1.5)
-      delta = 0.15;
-
-    joint_group_positions_arm[1] += delta; // Elbow
-
-    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
-                joint_group_positions_arm[1]);
-
-    move_group_arm.setJointValueTarget(joint_group_positions_arm);
+    target_pose1.position.z = target_pose1.position.z + delta;
+    move_group_arm.setPoseTarget(target_pose1);
 
     bool success_arm = (move_group_arm.plan(my_plan_arm) ==
                         moveit::planning_interface::MoveItErrorCode::SUCCESS);
 
-    if (success_arm) {
-      move_group_arm.execute(my_plan_arm);
-      return true;
+    (void)success_arm;
 
-    } else {
-      return false;
-    }
+    // Execute
+    move_group_arm.execute(my_plan_arm);
+
+    RCLCPP_INFO(LOGGER, "Deapproach finished: %.2f",
+                joint_group_positions_arm[0]);
   }
 
   bool move_to_drop() {
 
     RCLCPP_INFO(LOGGER, "Planning  to drop");
 
-    // Copy join values
-    mtx.lock();
-    this->joint_group_positions_arm = this->joint_group_positions_arm_tmp;
-    mtx.unlock();
-
-    for (auto x : this->joint_group_positions_arm) {
-      RCLCPP_INFO(LOGGER, "joint_group_positions_arm: %.2f", x);
-    }
-
     // For some reason I cannot get current  joint positions, so I need to use
     // basolute positions
 
-    float delta = 3.14;
-
-    if (joint_group_positions_arm[0] > 0)
-      delta = -3.14;
-
-    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
-                joint_group_positions_arm[0]);
-
-    // joint_group_positions_arm[0] += 3.14; // Elbow
-    // joint_group_positions_arm[1] = -2.09; // Shoulder Lift
-    joint_group_positions_arm[0] += delta; // Shoulder Pan
-    // joint_group_positions_arm[3] = 4.58;  // Wrist 1
-    // joint_group_positions_arm[4] = 1.57;  // Wrist 2
-    // joint_group_positions_arm[5] = 5.7;   // Wrist 3
+    joint_group_positions_arm[0] = 1.0;   // Shoulder Pan
+    joint_group_positions_arm[1] = -2.09; // Shoulder Lift
+    joint_group_positions_arm[2] = 4.13;  // Elbow
+    joint_group_positions_arm[3] = 4.58;  // Wrist 1
+    joint_group_positions_arm[4] = 1.57;  // Wrist 2
+    joint_group_positions_arm[5] = 5.7;   // Wrist 3
 
     move_group_arm.setJointValueTarget(joint_group_positions_arm);
 
-    // // move_group_arm.setPoseTarget(target_pose1);
+    // move_group_arm.setPoseTarget(target_pose1);
 
     bool success_arm = (move_group_arm.plan(my_plan_arm) ==
                         moveit::planning_interface::MoveItErrorCode::SUCCESS);
@@ -326,79 +286,35 @@ public:
     get_info();
     current_state();
 
-    RCLCPP_INFO(LOGGER, "pregrasp()");
+    // status = pregrasp();
 
-    status = pregrasp();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "pregrasp() failed");
-      return;
-    }
-    rclcpp::Rate(1.0).sleep();
+    // if (status) {
+    //   open_gripper();
+    // }
 
-    RCLCPP_INFO(LOGGER, "open_gripper()");
-
-    status = open_gripper();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "open_gripper() failed");
-      return;
-    }
-    rclcpp::Rate(1.0).sleep();
-
-    // RCLCPP_INFO(LOGGER, "approach()");
-
-    status = approach();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "approach() failed");
-      return;
-    }
-    rclcpp::Rate(1.0).sleep();
-
-    RCLCPP_INFO(LOGGER, "close_gripper()");
-
-    status = close_gripper();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "close_gripper() failed");
-      return;
-    }
-    rclcpp::Rate(1.0).sleep();
+    // status = approach();
 
     // current_state();
 
-    RCLCPP_INFO(LOGGER, "deapproach()");
-
-    status = deapproach();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "deapproach() failed");
-      return;
-    }
-    rclcpp::Rate(1.0).sleep();
+    // close_gripper();
 
     // current_state();
 
-    RCLCPP_INFO(LOGGER, "move_to_drop()");
-
-    status = move_to_drop();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "move_to_drop() failed");
-      return;
-    }
+    // deapproach();
 
     // current_state();
 
-    status = open_gripper();
-    if (!status) {
-      RCLCPP_ERROR(LOGGER, "open_gripper() failed");
-      return;
-    }
+    // move_to_drop();
 
-    RCLCPP_ERROR(LOGGER, "Mission finished succesfully");
+    // current_state();
+
+    // open_gripper();
   }
 
 private:
   moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
 
-  std::vector<double> joint_group_positions_arm_tmp{0, 0, 0, 0, 0, 0};
-
+  std::vector<double> joint_group_positions_arm_tmp;
   std::vector<double> joint_group_positions_arm;
   std::vector<double> joint_group_positions_gripper;
 
@@ -410,9 +326,9 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
 
   moveit::planning_interface::MoveGroupInterface move_group_arm;
-  const moveit::core::JointModelGroup *joint_model_group_arm;
-
   moveit::planning_interface::MoveGroupInterface move_group_gripper;
+
+  const moveit::core::JointModelGroup *joint_model_group_arm;
   const moveit::core::JointModelGroup *joint_model_group_gripper;
 
   moveit::core::RobotStatePtr current_state_arm;
