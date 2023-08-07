@@ -1,0 +1,540 @@
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+
+#include <moveit_msgs/msg/display_robot_state.hpp>
+#include <moveit_msgs/msg/display_trajectory.hpp>
+
+#include <moveit_msgs/msg/attached_collision_object.hpp>
+#include <moveit_msgs/msg/collision_object.hpp>
+
+#include "rclcpp/duration.hpp"
+#include "rclcpp/logging.hpp"
+#include "rclcpp/rate.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp/utilities.hpp"
+#include <string>
+
+#include "grasping_msgs/action/find_graspable_objects.hpp"
+#include <array>
+#include <mutex>
+#include <sensor_msgs/msg/joint_state.hpp>
+
+static const rclcpp::Logger LOGGER =
+    rclcpp::get_logger("pick_and_place_perception");
+static const std::string PLANNING_GROUP_ARM = "ur_manipulator";
+static const std::string PLANNING_GROUP_GRIPPER = "gripper";
+
+std::mutex mtx;
+
+class PickAndPlace : public rclcpp::Node {
+public:
+  using Find = grasping_msgs::action::FindGraspableObjects;
+  using GoalHandleFind = rclcpp_action::ClientGoalHandle<Find>;
+
+  PickAndPlace(std::shared_ptr<rclcpp::Node> move_group_node)
+      : Node("pick_and_place"),
+        move_group_arm(move_group_node, PLANNING_GROUP_ARM),
+        joint_model_group_arm(
+            move_group_arm.getCurrentState()->getJointModelGroup(
+                PLANNING_GROUP_ARM)),
+        move_group_gripper(move_group_node, PLANNING_GROUP_GRIPPER),
+        joint_model_group_gripper(
+            move_group_gripper.getCurrentState()->getJointModelGroup(
+                PLANNING_GROUP_GRIPPER)) {
+
+    callback_group_timer =
+        this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    this->timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(500),
+        std::bind(&PickAndPlace::timer_callback, this), callback_group_timer);
+
+    auto callback_group_sub =
+        create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = callback_group_sub;
+
+    this->sub_joint_states =
+        this->create_subscription<sensor_msgs::msg::JointState>(
+            "/joint_states", rclcpp::SensorDataQoS(),
+            std::bind(&PickAndPlace::joint_state_clb, this,
+                      std::placeholders::_1),
+            options);
+
+    this->client_ptr_ = rclcpp_action::create_client<Find>(
+        this->get_node_base_interface(), this->get_node_graph_interface(),
+        this->get_node_logging_interface(),
+        this->get_node_waitables_interface(), "find_objects");
+
+  } // end of constructor
+
+  void joint_state_clb(const sensor_msgs::msg::JointState::SharedPtr msg) {
+    mtx.lock();
+
+    this->joint_group_positions_arm_tmp[0] = msg->position[3];
+    this->joint_group_positions_arm_tmp[1] = msg->position[2];
+    this->joint_group_positions_arm_tmp[2] = msg->position[0];
+    this->joint_group_positions_arm_tmp[3] = msg->position[4];
+    this->joint_group_positions_arm_tmp[4] = msg->position[5];
+    this->joint_group_positions_arm_tmp[5] = msg->position[6];
+
+    mtx.unlock();
+  }
+
+  bool is_goal_done() const { return this->goal_done_; }
+
+  void send_goal() {
+    using namespace std::placeholders;
+
+    this->goal_done_ = false;
+    this->got_perception_data = false;
+
+    if (!this->client_ptr_) {
+      RCLCPP_ERROR(LOGGER, "Action client not initialized, restart node");
+      this->goal_done_ = true;
+      return;
+    }
+
+    if (!this->client_ptr_->wait_for_action_server(std::chrono::seconds(15))) {
+      RCLCPP_ERROR(LOGGER, "Action server not available after waiting");
+      this->goal_done_ = true;
+      return;
+    }
+
+    auto goal_msg = Find::Goal();
+    goal_msg.plan_grasps = false;
+
+    RCLCPP_INFO(LOGGER, "Sending goal");
+
+    auto send_goal_options = rclcpp_action::Client<Find>::SendGoalOptions();
+    send_goal_options.goal_response_callback =
+        std::bind(&PickAndPlace::goal_response_callback, this, _1);
+    send_goal_options.feedback_callback =
+        std::bind(&PickAndPlace::feedback_callback, this, _1, _2);
+    send_goal_options.result_callback =
+        std::bind(&PickAndPlace::result_callback, this, _1);
+    auto goal_handle_future =
+        this->client_ptr_->async_send_goal(goal_msg, send_goal_options);
+  }
+
+  // Getting Basic Information
+  void get_info() {
+
+    RCLCPP_INFO(LOGGER, "Planning frame: %s",
+                move_group_arm.getPlanningFrame().c_str());
+    RCLCPP_INFO(LOGGER, "End-effector link: %s",
+                move_group_arm.getEndEffectorLink().c_str());
+    RCLCPP_INFO(LOGGER, "Available Planning Groups:");
+    std::copy(move_group_arm.getJointModelGroupNames().begin(),
+              move_group_arm.getJointModelGroupNames().end(),
+              std::ostream_iterator<std::string>(std::cout, ", "));
+  }
+
+  void current_state() {
+    RCLCPP_INFO(LOGGER, "Get Robot Current State");
+
+    // current_state_arm = move_group_arm.getCurrentState(10);
+
+    current_state_arm = move_group_arm.getCurrentState(10);
+
+    current_state_gripper = move_group_gripper.getCurrentState(10);
+
+    current_state_arm->copyJointGroupPositions(this->joint_model_group_arm,
+                                               this->joint_group_positions_arm);
+
+    current_state_gripper->copyJointGroupPositions(
+        this->joint_model_group_gripper, this->joint_group_positions_gripper);
+  }
+
+  // Plan to End-Effector Pose
+  bool pregrasp() {
+
+    RCLCPP_INFO(LOGGER, "Planning to End-Effector Pose");
+
+    target_pose1.orientation.x = -1.0;
+    target_pose1.orientation.y = 0.00;
+    target_pose1.orientation.z = 0.00;
+    target_pose1.orientation.w = 0.00;
+    target_pose1.position.x = pose_x;
+    target_pose1.position.y = pose_y;
+    target_pose1.position.z = 0.30;
+
+    move_group_arm.setPoseTarget(target_pose1);
+
+    bool success_arm = (move_group_arm.plan(my_plan_arm) ==
+                        moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    (void)success_arm;
+
+    RCLCPP_INFO(LOGGER, "Planning to End-Effector Pose finished: %d",
+                success_arm);
+
+    if (success_arm) {
+      move_group_arm.execute(my_plan_arm);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  bool open_gripper() {
+    RCLCPP_INFO(LOGGER, "Open Gripper!");
+
+    joint_group_positions_gripper[0] = 0.35;
+    move_group_gripper.setJointValueTarget(joint_group_positions_gripper);
+
+    bool success_gripper =
+        (move_group_gripper.plan(my_plan_gripper) ==
+         moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    (void)success_gripper;
+
+    if (success_gripper) {
+      // Execute
+      move_group_gripper.execute(my_plan_gripper);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  bool approach() {
+
+    RCLCPP_INFO(LOGGER, "Approach to object");
+
+    float delta = 0.05;
+
+    target_pose1.position.z = target_pose1.position.z - delta;
+    move_group_arm.setPoseTarget(target_pose1);
+
+    bool success_arm = (move_group_arm.plan(my_plan_arm) ==
+                        moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    (void)success_arm;
+
+    if (success_arm) {
+      move_group_arm.execute(my_plan_arm);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  bool close_gripper() {
+    RCLCPP_INFO(LOGGER, "Close Gripper!");
+
+    joint_group_positions_gripper[0] = -0.65;
+    move_group_gripper.setJointValueTarget(joint_group_positions_gripper);
+
+    bool success_gripper =
+        (move_group_gripper.plan(my_plan_gripper) ==
+         moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    (void)success_gripper;
+
+    if (success_gripper) {
+      // Execute
+      move_group_gripper.execute(my_plan_gripper);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  bool deapproach() {
+
+    RCLCPP_INFO(LOGGER, "Deapproach to object");
+
+    // Copy join values
+    mtx.lock();
+    this->joint_group_positions_arm = this->joint_group_positions_arm_tmp;
+    mtx.unlock();
+
+    for (auto x : this->joint_group_positions_arm) {
+      RCLCPP_INFO(LOGGER, "joint_group_positions_arm: %.2f", x);
+    }
+
+    // For some reason I cannot get current  joint positions, so I need to use
+    // basolute positions
+
+    float delta = -0.15;
+
+    if (joint_group_positions_arm[1] < -1.5)
+      delta = 0.15;
+
+    joint_group_positions_arm[1] += delta; // Elbow
+
+    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
+                joint_group_positions_arm[1]);
+
+    move_group_arm.setJointValueTarget(joint_group_positions_arm);
+
+    bool success_arm = (move_group_arm.plan(my_plan_arm) ==
+                        moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    if (success_arm) {
+      move_group_arm.execute(my_plan_arm);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  bool move_to_drop() {
+
+    RCLCPP_INFO(LOGGER, "Planning  to drop");
+
+    // Copy join values
+    mtx.lock();
+    this->joint_group_positions_arm = this->joint_group_positions_arm_tmp;
+    mtx.unlock();
+
+    for (auto x : this->joint_group_positions_arm) {
+      RCLCPP_INFO(LOGGER, "joint_group_positions_arm: %.2f", x);
+    }
+
+    // For some reason I cannot get current  joint positions, so I need to use
+    // basolute positions
+
+    float delta = 3.14;
+
+    if (joint_group_positions_arm[0] > 0)
+      delta = -3.14;
+
+    RCLCPP_INFO(LOGGER, "joint_group_positions_arm elbow: %.2f",
+                joint_group_positions_arm[0]);
+
+    // joint_group_positions_arm[0] += 3.14; // Elbow
+    // joint_group_positions_arm[1] = -2.09; // Shoulder Lift
+    joint_group_positions_arm[0] += delta; // Shoulder Pan
+    // joint_group_positions_arm[3] = 4.58;  // Wrist 1
+    // joint_group_positions_arm[4] = 1.57;  // Wrist 2
+    // joint_group_positions_arm[5] = 5.7;   // Wrist 3
+
+    move_group_arm.setJointValueTarget(joint_group_positions_arm);
+
+    // // move_group_arm.setPoseTarget(target_pose1);
+
+    bool success_arm = (move_group_arm.plan(my_plan_arm) ==
+                        moveit::planning_interface::MoveItErrorCode::SUCCESS);
+
+    (void)success_arm;
+
+    RCLCPP_INFO(LOGGER, "Planning  to drop finished: %d", success_arm);
+
+    if (success_arm) {
+      move_group_arm.execute(my_plan_arm);
+      return true;
+
+    } else {
+      return false;
+    }
+  }
+
+  // Timer Callback function
+  void timer_callback() {
+
+    bool status;
+
+    this->timer_->cancel();
+
+    get_info();
+    current_state();
+
+    RCLCPP_INFO(LOGGER, "Getting perception info...");
+
+    send_goal();
+
+    while (!goal_done_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    if (!got_perception_data) {
+      RCLCPP_INFO(LOGGER, "Could not get perception data, restart node or "
+                          "check, that object is present");
+      return;
+    }
+    RCLCPP_INFO(LOGGER, "Got perception info!");
+
+    RCLCPP_INFO(LOGGER, "pregrasp()");
+    status = pregrasp();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "pregrasp() failed");
+      return;
+    }
+    rclcpp::Rate(1.0).sleep();
+
+    RCLCPP_INFO(LOGGER, "open_gripper()");
+
+    status = open_gripper();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "open_gripper() failed");
+      return;
+    }
+    rclcpp::Rate(1.0).sleep();
+
+    RCLCPP_INFO(LOGGER, "approach()");
+
+    status = approach();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "approach() failed");
+      return;
+    }
+    rclcpp::Rate(1.0).sleep();
+
+    RCLCPP_INFO(LOGGER, "close_gripper()");
+
+    status = close_gripper();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "close_gripper() failed");
+      return;
+    }
+    rclcpp::Rate(1.0).sleep();
+
+    // current_state();
+
+    RCLCPP_INFO(LOGGER, "deapproach()");
+
+    status = deapproach();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "deapproach() failed");
+      return;
+    }
+    rclcpp::Rate(1.0).sleep();
+
+    // current_state();
+
+    RCLCPP_INFO(LOGGER, "move_to_drop()");
+
+    status = move_to_drop();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "move_to_drop() failed");
+      return;
+    }
+
+    // current_state();
+
+    status = open_gripper();
+    if (!status) {
+      RCLCPP_ERROR(LOGGER, "open_gripper() failed");
+      return;
+    }
+
+    RCLCPP_ERROR(LOGGER, "Mission finished succesfully");
+  }
+
+private:
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+
+  std::vector<double> joint_group_positions_arm_tmp{0, 0, 0, 0, 0, 0};
+
+  std::vector<double> joint_group_positions_arm;
+  std::vector<double> joint_group_positions_gripper;
+
+  geometry_msgs::msg::Pose target_pose1;
+
+  moveit::planning_interface::MoveGroupInterface::Plan my_plan_arm;
+  moveit::planning_interface::MoveGroupInterface::Plan my_plan_gripper;
+
+  rclcpp::CallbackGroup::SharedPtr callback_group_timer;
+  rclcpp::TimerBase::SharedPtr timer_;
+
+  moveit::planning_interface::MoveGroupInterface move_group_arm;
+  const moveit::core::JointModelGroup *joint_model_group_arm;
+
+  moveit::planning_interface::MoveGroupInterface move_group_gripper;
+  const moveit::core::JointModelGroup *joint_model_group_gripper;
+
+  moveit::core::RobotStatePtr current_state_arm;
+  moveit::core::RobotStatePtr current_state_gripper;
+
+  // Joint state subscriber
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
+      sub_joint_states;
+
+  // Action client
+  rclcpp_action::Client<Find>::SharedPtr client_ptr_;
+  bool goal_done_ = false;
+  bool got_perception_data = false;
+
+  // Goal saving
+  float pose_x = 0.0;
+  float pose_y = 0.0;
+  float pose_z = 0.0;
+
+  void
+  goal_response_callback(std::shared_future<GoalHandleFind::SharedPtr> future) {
+    auto goal_handle = future.get();
+    if (!goal_handle) {
+      RCLCPP_ERROR(LOGGER, "Goal was rejected by server");
+      this->goal_done_ = true;
+    } else {
+      RCLCPP_INFO(LOGGER, "Goal accepted by server, waiting for result");
+    }
+  }
+
+  void feedback_callback(GoalHandleFind::SharedPtr,
+                         const std::shared_ptr<const Find::Feedback> feedback) {
+    RCLCPP_INFO(LOGGER, "Ignoring feedback...");
+    (void)feedback;
+  }
+
+  void result_callback(const GoalHandleFind::WrappedResult &result) {
+    this->goal_done_ = true;
+    switch (result.code) {
+    case rclcpp_action::ResultCode::SUCCEEDED:
+      break;
+    case rclcpp_action::ResultCode::ABORTED:
+      RCLCPP_ERROR(LOGGER, "Goal was aborted");
+      return;
+    case rclcpp_action::ResultCode::CANCELED:
+      RCLCPP_ERROR(LOGGER, "Goal was canceled");
+      return;
+    default:
+      RCLCPP_ERROR(LOGGER, "Unknown result code");
+      return;
+    }
+
+    for (auto object : result.result->objects) {
+      //   RCLCPP_INFO(this->get_logger(), "Type: %d",
+      //   object.object.primitives[0].type); RCLCPP_INFO(this->get_logger(),
+      //   "x: %f", object.object.primitives[0].dimensions[0]);
+      //   RCLCPP_INFO(this->get_logger(), "Y: %f",
+      //   object.object.primitives[0].dimensions[1]);
+      //   RCLCPP_INFO(this->get_logger(), "Z: %f",
+      //   object.object.primitives[0].dimensions[2]);
+
+      RCLCPP_INFO(LOGGER, "Perception result received");
+      pose_x = object.object.primitive_poses[0].position.x;
+      pose_y = object.object.primitive_poses[0].position.y;
+      pose_z = object.object.primitive_poses[0].position.z;
+      RCLCPP_INFO(LOGGER, "X: %f", pose_x);
+      RCLCPP_INFO(LOGGER, "Y: %f", pose_y);
+      RCLCPP_INFO(LOGGER, "Z: %f", pose_z);
+
+      this->got_perception_data = true;
+    }
+  }
+
+}; // End of Class
+
+int main(int argc, char **argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::NodeOptions node_options;
+  node_options.automatically_declare_parameters_from_overrides(true);
+  auto move_group_node =
+      rclcpp::Node::make_shared("move_group_demo", node_options);
+
+  rclcpp::executors::MultiThreadedExecutor planner_executor;
+  std::shared_ptr<PickAndPlace> planner_node =
+      std::make_shared<PickAndPlace>(move_group_node);
+  planner_executor.add_node(planner_node);
+  planner_executor.spin();
+
+  rclcpp::shutdown();
+  return 0;
+}

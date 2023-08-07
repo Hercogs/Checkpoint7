@@ -171,7 +171,7 @@ def generate_launch_description():
 
     trajectory_execution = {
         "moveit_manage_controllers": False,
-        "trajectory_execution.allowed_execution_duration_scaling": 1.2,
+        "trajectory_execution.allowed_execution_duration_scaling": 10.0,
         "trajectory_execution.allowed_goal_duration_margin": 0.5,
         "trajectory_execution.allowed_start_tolerance": 0.1,
     }
@@ -217,7 +217,7 @@ def generate_launch_description():
         package="rviz2",
         condition=IfCondition(launch_rviz),
         executable="rviz2",
-        name="rviz2_moveit",
+        name="rviz2_moveit_node",
         output="log",
         arguments=["-d", rviz_config_file],
         parameters=[

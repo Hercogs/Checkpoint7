@@ -19,7 +19,7 @@ gripper_controller:
   default: True
   type: GripperCommand
   joints:
-    - egh_gripper_finger_left_joint
+    - rg2_gripper_finger_left_joint
 
 
 

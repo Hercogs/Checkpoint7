@@ -1,5 +1,5 @@
 controller_list:
-  - name: ur_manipulator_controller
+  - name: scaled_pos_joint_traj_controller
     action_ns: follow_joint_trajectory
     type: FollowJointTrajectory
     default: True
@@ -11,8 +11,8 @@ controller_list:
       - wrist_2_joint
       - wrist_3_joint
   - name: gripper_controller
-    action_ns: follow_joint_trajectory
-    type: FollowJointTrajectory
+    action_ns: gripper_cmd
+    type: GripperCommand
     default: True
     joints:
       - rg2_gripper_finger_left_joint
